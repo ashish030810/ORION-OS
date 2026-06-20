@@ -1,280 +1,253 @@
 /*
  * =========================================================================
- * 🌿 ASTRO-FLORA / ORION-OS : UNIFIED CONTROL KERNEL (ESP32 SIMULATED)
+ * ORION-OS v1.2 – ESP32 Wokwi (Stable Overlay)
  * =========================================================================
- * Lead Systems Architect: ASHISH
- * Target Hardware Platform: ESP32 DevKit v1 (Wokwi Virtualization Layer)
+ * Button press → shows crew name on LCD for 10 seconds, beeps after 4s.
+ * No flicker, no premature changes.
  * =========================================================================
  */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// Initialize LCD Display Panel: I2C Address 0x27, 16 columns wide, 2 rows high
-// Note: On ESP32, Wire automatically connects to Pins 21 (SDA) and 22 (SCL)
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// =========================================================================
-// 🛠️ REGISTER PIN ASSIGNMENTS (MATCHING YOUR ESP32 BOARD CODES)
-// =========================================================================
-// Analog Inputs (Simulated Matrix Thresholds)
-const int PIN_SENSOR_MOISTURE_ZONE_A = 34;  // GPIO 34 (Analog Read Only)
-const int PIN_SENSOR_MOISTURE_ZONE_B = 35;  // GPIO 35 (Analog Read Only)
-const int PIN_SENSOR_THERMISTOR_AIR  = 32;  // GPIO 32
-const int PIN_SENSOR_FLUID_RESERVOIR = 33;  // GPIO 33
+// ========== PINS ==========
+const int PIN_BUTTON_SECURITY   = 4;
+const int PIN_BUTTON_DIAG       = 12;
+const int PIN_BUTTON_CREW       = 13;
+const int PIN_BUZZER            = 17;
+const int PIN_LED_RED           = 5;
+const int PIN_LED_GREEN         = 16;
 
-// Digital Inputs (Buttons using Internal Pull-Up Resistors)
-const int PIN_BUTTON_SECURITY_SCAN   = 4;   // GPIO 4 (Security Access Scan Button)
-const int PIN_BUTTON_DIAGNOSTICS    = 12;  // GPIO 12 (Diagnostics 'D' Button)
-const int PIN_BUTTON_CREW_MANIFEST   = 13;  // GPIO 13 (Crew Rotation 'C' Button)
+// ========== TIMING ==========
+const unsigned long BEEP_DELAY_MS    = 4000;   // 4 seconds
+const unsigned long DISPLAY_DURATION = 10000;  // 10 seconds (changed from 7 for clarity)
 
-// Digital Outputs (Actuators, Buzzers, and Display Signal LEDs)
-const int PIN_AUDIO_ALARM_BUZZER     = 17;  // GPIO 17 (Piezo Sound Elements)
-const int PIN_RELAY_THERMAL_HEATER   = 5;   // GPIO 5 (Red System LED Control)
-const int PIN_RELAY_EXHAUST_FAN      = 16;  // GPIO 16 (Green System LED Control)
+// ========== CREW DATA ==========
+const int TOTAL_CREW = 4;
+String crewNames[TOTAL_CREW] = {"1. ASHISH", "2. ALEX", "3. SAM", "4. ELENA"};
+bool crewInside[TOTAL_CREW] = {false, false, false, false};
+int currentCrewIndex = 0;
 
-// =========================================================================
-// ⚙️ SYSTEM SETPOINTS AND TIMING PARAMETERS
-// =========================================================================
-const int SETPOINT_DRY_THRESHOLD       = 450;
-const int SETPOINT_MIN_RESERVOIR_LEVEL = 200;
-const int SETPOINT_CRITICAL_LOW_TEMP   = 16;
-const int SETPOINT_CRITICAL_HIGH_TEMP  = 30;
+// ========== STATE ==========
+enum State { STANDBY, DIAGNOSTIC, CREW_MANIFEST };
+State systemState = STANDBY;
 
-const unsigned long DELAY_TELEMETRY_REFRESH = 4000;  // Serial update clock speed
-const unsigned long DELAY_SOLAR_CYCLE_SHIFT = 20000; // Simulated day duration
-const unsigned long DELAY_LCD_REFRESH       = 1000;  // Anti-flicker delay clock
-const unsigned long CREW_ROTATION_DELAY     = 2000;  // Crew names swap timing
+// ========== VARIABLES ==========
+unsigned long lastTelemetry = 0;
+unsigned long lastLcdRefresh = 0;
+unsigned long lastCrewRotate = 0;
+unsigned long currentMillis = 0;
 
-// =========================================================================
-// 📊 STATE ENGINE LOG SCHEMAS & VARIABLES
-// =========================================================================
-enum OperationalState {
-  STATE_STATION_STANDBY,
-  STATE_DIAGNOSTIC_SWEEP,
-  STATE_CREW_MANIFEST
-};
+// Overlay control
+bool overlayActive = false;
+unsigned long overlayStartTime = 0;
+String overlayName = "";
+String overlayAction = "";
 
-OperationalState currentKernelState = STATE_STATION_STANDBY;
+// Delayed beep
+bool beepPending = false;
+unsigned long beepTime = 0;
 
-unsigned long timeTrackerLastTelemetry   = 0;
-unsigned long timeTrackerLastSolarShift  = 0;
-unsigned long timeTrackerLastLcdRefresh  = 0;
-unsigned long timeTrackerLastCrewRotate  = 0;
-unsigned long timeTrackerCurrentExecution = 0;
+// Button edge detection
+bool lastButtonState = HIGH;
 
-bool statusFlagDaytimeCycleActive = true;
-int activeCrewDatabasePointer      = 0;
-const int TOTAL_AUTHORIZED_CREW    = 4;
+// ========== CUSTOM ICONS ==========
+uint8_t sprout[8] = {0b00100,0b00110,0b01100,0b00100,0b00100,0b01110,0b11111,0b00000};
+uint8_t sun[8]    = {0b00100,0b10101,0b01110,0b11011,0b01110,0b10101,0b00100,0b00000};
+uint8_t moon[8]   = {0b00110,0b01100,0b11000,0b11000,0b11000,0b01100,0b00110,0b00000};
+uint8_t warn[8]   = {0b00000,0b00100,0b01010,0b01010,0b11111,0b11111,0b00000,0b00000};
 
-unsigned long securityDisplayWindowMs = 0;
-bool showSecurityScreenOverlay = false;
-String dynamicSecurityName = "";
-String dynamicSecurityAction = "";
+// ========== PROTOTYPES ==========
+void handleSecurityPress();
+void runDiagnostics();
+void playBeep(int freq, int duration);
+void updateStandbyScreen(int moistureA, int moistureB, int temp, bool isDay);
 
-// Database Arrays
-String crewNameRegistry[TOTAL_AUTHORIZED_CREW] = {
-  "1. ASHISH (LEAD)", "2. ALEX (ENG)", "3. SAM (BIO)", "4. ELENA (PILOT)"
-};
-bool crewInsideStatus[TOTAL_AUTHORIZED_CREW] = {false, false, false, false};
-
-// Custom Hexadecimal LCD Glyphs 
-uint8_t graphicIconSprout[8]  = { 0b00100, 0b00110, 0b01100, 0b00100, 0b00100, 0b01110, 0b11111, 0b00000 };
-uint8_t graphicIconSun[8]     = { 0b00100, 0b10101, 0b01110, 0b11011, 0b01110, 0b10101, 0b00100, 0b00000 };
-uint8_t graphicIconMoon[8]    = { 0b00110, 0b01100, 0b11000, 0b11000, 0b11000, 0b01100, 0b00110, 0b00000 };
-uint8_t graphicIconWarning[8] = { 0b00000, 0b00100, 0b01010, 0b01010, 0b11111, 0b11111, 0b00000, 0b00000 };
-
-// Function Prototypes
-void executeCrewAccessTransaction();
-void executeSystemDiagnosticSweep();
-void executeAcousticPulse(int parameterFrequencyHz, int parameterDurationMs);
-
-// =========================================================================
-// 📌 SETUP INITIALIZATION SEQUENCE
-// =========================================================================
+// ========== SETUP ==========
 void setup() {
   Serial.begin(9600);
-  
-  // Power up and flash the liquid crystal matrix panel
+
   lcd.init();
   lcd.backlight();
-  
-  // Inject specialized pixel icon vectors into CGRAM chip storage
-  lcd.createChar(0, graphicIconSprout);
-  lcd.createChar(1, graphicIconSun);
-  lcd.createChar(2, graphicIconMoon);
-  lcd.createChar(3, graphicIconWarning);
-  
-  // Register pin operational modes across hardware map
-  pinMode(PIN_BUTTON_SECURITY_SCAN, INPUT_PULLUP);
-  pinMode(PIN_BUTTON_DIAGNOSTICS, INPUT_PULLUP);
-  pinMode(PIN_BUTTON_CREW_MANIFEST, INPUT_PULLUP);
-  
-  pinMode(PIN_RELAY_THERMAL_HEATER, OUTPUT);
-  pinMode(PIN_RELAY_EXHAUST_FAN, OUTPUT);
-  pinMode(PIN_AUDIO_ALARM_BUZZER, OUTPUT);
-  
-  // Set starting values
-  digitalWrite(PIN_RELAY_THERMAL_HEATER, LOW);
-  digitalWrite(PIN_RELAY_EXHAUST_FAN, LOW);
-  
-  executeAcousticPulse(880, 200);
-  
-  lcd.clear();
+  lcd.createChar(0, sprout);
+  lcd.createChar(1, sun);
+  lcd.createChar(2, moon);
+  lcd.createChar(3, warn);
+
+  pinMode(PIN_BUTTON_SECURITY, INPUT_PULLUP);
+  pinMode(PIN_BUTTON_DIAG, INPUT_PULLUP);
+  pinMode(PIN_BUTTON_CREW, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, LOW);
+
   lcd.print("ORION-OS v1.2");
   lcd.setCursor(0, 1);
-  lcd.print("ESP32 HUB ACTIVE");
-  
-  Serial.println(F("================================================================="));
-  Serial.println(F("🌌 ORION CONTROL KERNEL OPERATIONAL FOR STARDANCE SIMULATION"));
-  Serial.println(F("================================================================="));
-  
+  lcd.print("ESP32 READY");
   delay(2000);
-}
-
-// =========================================================================
-// 🔄 CORE ASYNCHRONOUS ENGINE LOOP
-// =========================================================================
-void loop() {
-  timeTrackerCurrentExecution = millis();
-  
-  // 1. Read Data Sensors (Simulated Inputs via Wokwi ADC channels)
-  int rawValueMoistureZoneA  = analogRead(PIN_SENSOR_MOISTURE_ZONE_A);
-  int rawValueMoistureZoneB  = analogRead(PIN_SENSOR_MOISTURE_ZONE_B);
-  int rawValueAtmosphereTemp = analogRead(PIN_SENSOR_THERMISTOR_AIR);
-  int rawValueWaterReservoir = analogRead(PIN_SENSOR_FLUID_RESERVOIR);
-  
-  int computedPercentMoistureA = map(rawValueMoistureZoneA, 0, 4095, 0, 100);
-  int computedPercentMoistureB = map(rawValueMoistureZoneB, 0, 4095, 0, 100);
-  int computedCelsiusDegree     = map(rawValueAtmosphereTemp, 0, 4095, -10, 50);
-
-  // 2. Hardware Interrupt Button Scans (Non-Blocking Inputs)
-  if (digitalRead(PIN_BUTTON_SECURITY_SCAN) == LOW) {
-    executeCrewAccessTransaction();
-    delay(250); // Simple debounce protection window
-  }
-  
-  if (digitalRead(PIN_BUTTON_DIAGNOSTICS) == LOW && currentKernelState != STATE_DIAGNOSTIC_SWEEP) {
-    executeSystemDiagnosticSweep();
-  }
-  
-  if (digitalRead(PIN_BUTTON_CREW_MANIFEST) == LOW) {
-    currentKernelState = (currentKernelState == STATE_CREW_MANIFEST) ? STATE_STATION_STANDBY : STATE_CREW_MANIFEST;
-    lcd.clear();
-    executeAcousticPulse(523, 100);
-    delay(250);
-  }
-
-  // 3. Solar Timing Grid System
-  if (timeTrackerCurrentExecution - timeTrackerLastSolarShift >= DELAY_SOLAR_CYCLE_SHIFT) {
-    statusFlagDaytimeCycleActive = !statusFlagDaytimeCycleActive;
-    timeTrackerLastSolarShift = timeTrackerCurrentExecution;
-  }
-  
-  // 4. Climate HVAC Automatic LED Outputs
-  if (computedCelsiusDegree < SETPOINT_CRITICAL_LOW_TEMP) {
-    digitalWrite(PIN_RELAY_THERMAL_HEATER, HIGH);  // Red LED Turns ON
-    digitalWrite(PIN_RELAY_EXHAUST_FAN, LOW);
-  } else if (computedCelsiusDegree > SETPOINT_CRITICAL_HIGH_TEMP) {
-    digitalWrite(PIN_RELAY_THERMAL_HEATER, LOW);
-    digitalWrite(PIN_RELAY_EXHAUST_FAN, HIGH);    // Green LED Turns ON
-  } else {
-    digitalWrite(PIN_RELAY_THERMAL_HEATER, LOW);
-    digitalWrite(PIN_RELAY_EXHAUST_FAN, LOW);
-  }
-  
-  // 5. Serial Logging Output Telemetry System
-  if (timeTrackerCurrentExecution - timeTrackerLastTelemetry >= DELAY_TELEMETRY_REFRESH) {
-    timeTrackerLastTelemetry = timeTrackerCurrentExecution;
-    Serial.println(F("\n🛰️ --- ORION-OS SYSTEM AUDIT DATALOG ---"));
-    Serial.print(F("Uptime Sync: ")); Serial.print(timeTrackerCurrentExecution / 1000); Serial.println(F("s"));
-    Serial.print(F("Zone A Soil Matrix: ")); Serial.print(computedPercentMoistureA); Serial.println(F("%"));
-    Serial.print(F("Atmosphere Module Heat: ")); Serial.print(computedCelsiusDegree); Serial.println(F(" C"));
-    Serial.println(F("--------------------------------------------------"));
-  }
-  
-  // 6. Non-Blocking Screen Refresh Panel Engine (Stops flickering)
-  if (timeTrackerCurrentExecution - timeTrackerLastLcdRefresh >= DELAY_LCD_REFRESH) {
-    timeTrackerLastLcdRefresh = timeTrackerCurrentExecution;
-    
-    if (showSecurityScreenOverlay && (timeTrackerCurrentExecution - securityDisplayWindowMs >= 2500)) {
-      showSecurityScreenOverlay = false;
-      lcd.clear();
-    }
-
-    if (showSecurityScreenOverlay) {
-      lcd.setCursor(0, 0);
-      lcd.print(dynamicSecurityName);
-      lcd.setCursor(0, 1);
-      lcd.print(dynamicSecurityAction);
-    } 
-    else if (currentKernelState == STATE_DIAGNOSTIC_SWEEP) {
-      // Handled actively inside the sweep loop method
-    }
-    else if (currentKernelState == STATE_CREW_MANIFEST) {
-      if (timeTrackerCurrentExecution - timeTrackerLastCrewRotate >= CREW_ROTATION_DELAY) {
-        timeTrackerLastCrewRotate = timeTrackerCurrentExecution;
-        activeCrewDatabasePointer = (activeCrewDatabasePointer + 1) % TOTAL_AUTHORIZED_CREW;
-      }
-      lcd.setCursor(0, 0);
-      lcd.print("CREW REGISTRY:");
-      lcd.setCursor(0, 1);
-      lcd.print(crewNameRegistry[activeCrewDatabasePointer]);
-    }
-    else { // Default Standby Screen Display Layer
-      lcd.setCursor(0, 0);
-      lcd.write(0); // Display sprout glyph
-      lcd.print(" A:"); lcd.print(computedPercentMoistureA);
-      lcd.print("% B:"); lcd.print(computedPercentMoistureB); lcd.print("%");
-      
-      lcd.setCursor(0, 1);
-      if (statusFlagDaytimeCycleActive) { lcd.write(1); lcd.print(" DAY "); }
-      else { lcd.write(2); lcd.print(" NIGHT"); }
-      lcd.print(" T:"); lcd.print(computedCelsiusDegree); lcd.print("C");
-    }
-  }
-  
-  delay(20); // Small cycle governor
-}
-
-// =========================================================================
-// 📡 INTERFACE SUBROUTINES
-// =========================================================================
-void executeCrewAccessTransaction() {
-  crewInsideStatus[activeCrewDatabasePointer] = !crewInsideStatus[activeCrewDatabasePointer];
-  
-  dynamicSecurityName = crewNameRegistry[activeCrewDatabasePointer];
-  bool isInside = crewInsideStatus[activeCrewDatabasePointer];
-  dynamicSecurityAction = isInside ? "-> STATUS: ENTRY" : "-> STATUS: EXIT";
-  
-  showSecurityScreenOverlay = true;
-  securityDisplayWindowMs = millis();
   lcd.clear();
-  
-  if (isInside) { executeAcousticPulse(523, 100); executeAcousticPulse(659, 100); } 
-  else { executeAcousticPulse(659, 100); executeAcousticPulse(523, 100); }
+
+  Serial.println(F("========================================"));
+  Serial.println(F("🌌 ORION-OS STARTED"));
+  Serial.println(F("========================================"));
 }
 
-void executeSystemDiagnosticSweep() {
-  currentKernelState = STATE_DIAGNOSTIC_SWEEP;
-  Serial.println(F("\n[DIAGNOSTICS] Starting system sweep verification..."));
-  
-  for (int progress = 25; progress <= 100; progress += 25) {
+// ========== LOOP ==========
+void loop() {
+  currentMillis = millis();
+
+  // ----- 1. Read Sensors (simulated) -----
+  int moistureA = map(analogRead(34), 0, 4095, 0, 100);
+  int moistureB = map(analogRead(35), 0, 4095, 0, 100);
+  int tempC     = map(analogRead(32), 0, 4095, -10, 50);
+  bool isDay    = (currentMillis / 20000) % 2 == 0;
+
+  // ----- 2. Security Button (Edge Detection) -----
+  bool currentButton = digitalRead(PIN_BUTTON_SECURITY);
+  if (currentButton == LOW && lastButtonState == HIGH) {
+    handleSecurityPress();
+  }
+  lastButtonState = currentButton;
+
+  // ----- 3. Diagnostics Button -----
+  if (digitalRead(PIN_BUTTON_DIAG) == LOW && systemState != DIAGNOSTIC) {
+    runDiagnostics();
+    delay(200);
+  }
+
+  // ----- 4. Crew Manifest Toggle -----
+  if (digitalRead(PIN_BUTTON_CREW) == LOW) {
+    if (systemState == CREW_MANIFEST) systemState = STANDBY;
+    else systemState = CREW_MANIFEST;
+    delay(200);
+  }
+
+  // ----- 5. Handle Delayed Beep -----
+  if (beepPending && currentMillis >= beepTime) {
+    beepPending = false;
+    playBeep(523, 200);
+    Serial.println(F("🔊 BEEP! (4s delay completed)"));
+  }
+
+  // ----- 6. Check Overlay Timeout (10 seconds) -----
+  if (overlayActive && (currentMillis - overlayStartTime >= DISPLAY_DURATION)) {
+    overlayActive = false;
+    lcd.clear();
+    Serial.println(F("⏹️ Overlay ended. Back to standby."));
+  }
+
+  // ----- 7. Serial Telemetry (every 4s) -----
+  if (currentMillis - lastTelemetry >= 4000) {
+    lastTelemetry = currentMillis;
+    Serial.print(F("📊 Uptime: ")); Serial.print(currentMillis/1000); Serial.println("s");
+  }
+
+  // ----- 8. LCD Refresh (non-blocking, every 1s) -----
+  // ⚠️ CRITICAL: If overlay is active, we SKIP everything else!
+  if (currentMillis - lastLcdRefresh >= 1000) {
+    lastLcdRefresh = currentMillis;
+
+    // --- OVERLAY ACTIVE: Show the crew name/action (and do NOTHING else) ---
+    if (overlayActive) {
+      // The LCD was already set in handleSecurityPress().
+      // We do NOT clear or redraw here – that would cause flicker.
+      // Just skip to the end.
+      // (We don't need to do anything here because the text stays perfectly.)
+    }
+    // --- DIAGNOSTIC MODE ---
+    else if (systemState == DIAGNOSTIC) {
+      // Handled inside runDiagnostics()
+    }
+    // --- CREW MANIFEST MODE ---
+    else if (systemState == CREW_MANIFEST) {
+      if (currentMillis - lastCrewRotate >= 2000) {
+        lastCrewRotate = currentMillis;
+        currentCrewIndex = (currentCrewIndex + 1) % TOTAL_CREW;
+      }
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("CREW MANIFEST");
+      lcd.setCursor(0, 1);
+      lcd.print(crewNames[currentCrewIndex]);
+    }
+    // --- STANDBY MODE (Main Dashboard) ---
+    else {
+      updateStandbyScreen(moistureA, moistureB, tempC, isDay);
+    }
+  }
+
+  delay(20);
+}
+
+// ========== SECURITY PRESS ==========
+void handleSecurityPress() {
+  // Toggle entry/exit
+  crewInside[currentCrewIndex] = !crewInside[currentCrewIndex];
+  bool inside = crewInside[currentCrewIndex];
+
+  overlayName = crewNames[currentCrewIndex];
+  overlayAction = inside ? "STATUS: ENTRY" : "STATUS: EXIT";
+
+  // Show immediately on LCD
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(overlayName);
+  lcd.setCursor(0, 1);
+  lcd.print(overlayAction);
+
+  // Activate overlay (this will block standby updates for 10 seconds)
+  overlayActive = true;
+  overlayStartTime = millis();
+
+  // Schedule the beep for 4 seconds later
+  beepPending = true;
+  beepTime = millis() + BEEP_DELAY_MS;
+
+  // Advance to next crew member for next press
+  currentCrewIndex = (currentCrewIndex + 1) % TOTAL_CREW;
+
+  // Debug log
+  Serial.println(F("🔒 BUTTON PRESSED"));
+  Serial.print(F("   Showing: ")); Serial.println(overlayName);
+  Serial.print(F("   Overlay active for ")); Serial.print(DISPLAY_DURATION/1000); Serial.println("s");
+  Serial.print(F("   Beep scheduled in ")); Serial.print(BEEP_DELAY_MS/1000); Serial.println("s");
+}
+
+// ========== DIAGNOSTICS ==========
+void runDiagnostics() {
+  systemState = DIAGNOSTIC;
+  Serial.println(F("[DIAG] Starting sweep..."));
+  for (int p = 25; p <= 100; p += 25) {
     lcd.clear();
     lcd.setCursor(0, 0);
-    lcd.print("SYSTEM DIAGNOSTICS");
+    lcd.print("DIAGNOSTICS");
     lcd.setCursor(0, 1);
-    lcd.write(3); // Warning sign
-    lcd.print(" STATUS: "); lcd.print(progress); lcd.print("%");
-    executeAcousticPulse(440, 80);
-    delay(400); 
+    lcd.write(3); lcd.print(" "); lcd.print(p); lcd.print("%");
+    playBeep(440, 80);
+    delay(400);
   }
-  
-  Serial.println(F("[DIAGNOSTICS] Concluded. Status: NOMINAL"));
-  currentKernelState = STATE_STATION_STANDBY;
+  Serial.println(F("[DIAG] Complete."));
+  systemState = STANDBY;
   lcd.clear();
 }
 
-void executeAcousticPulse(int parameterFrequencyHz, int parameterDurationMs) {
-  tone(PIN_AUDIO_ALARM_BUZZER, parameterFrequencyHz, parameterDurationMs);
+// ========== STANDBY SCREEN ==========
+void updateStandbyScreen(int mA, int mB, int temp, bool isDay) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.write(0); lcd.print(" A:"); lcd.print(mA); lcd.print("% B:"); lcd.print(mB); lcd.print("%");
+  lcd.setCursor(0, 1);
+  if (isDay) { lcd.write(1); lcd.print(" DAY "); } 
+  else { lcd.write(2); lcd.print(" NIGHT"); }
+  lcd.print(" T:"); lcd.print(temp); lcd.print("C");
+}
+
+// ========== BUZZER ==========
+void playBeep(int freq, int duration) {
+  tone(PIN_BUZZER, freq, duration);
+  delay(10);
 }
